@@ -1,11 +1,16 @@
 """
 Kaggriculture Competitive Agent - Main Submission File
-Advanced Features:
+Tournament Level Features:
  1. Price Volatility & Supply Glut Detector (20%+ price drop detection & hold)
  2. Targeted Fertilizer Delivery Pipeline (Melon Days 6-8, Wheat/Carrot Day 2)
  3. Predictive Town Demand Pre-Planting (2-day advance planting for shop unlocks)
  4. Early-Morning Burst Farm Hand Hiring (Hour 0-2 Fibonacci optimization)
  5. Dynamic Livestock Diversification (Cows, Sheep, Geese) & Cash Buffer Guard
+ 6. Town Shop Premium Arbitrage Engine (Every 4th hour premium sell batching)
+ 7. Spatial Farm Zoning (Shed-adjacent livestock placement & crop clustering)
+ 8. Bulk Seed Stockpiling (Preserves 10 market order slots for harvest turns)
+ 9. Opponent State Parsing & Counter-Play (Feed demand exploitation & glut avoidance)
+10. Ongoing Crop Flow Lock Prevention (Priority harvest for Tomato/Strawberry)
 """
 
 from collections import deque
@@ -64,6 +69,10 @@ def is_adjacent_to_shed(pos):
             return True
     return False
 
+def min_dist_to_shed(pos):
+    x, y = pos
+    return min(abs(x - sx) + abs(y - sy) for sx, sy in SHED_TILES)
+
 def manhattan(p1, p2):
     return abs(p1[0] - p2[0]) + abs(p1[1] - p2[1])
 
@@ -121,7 +130,7 @@ def move_towards(pos, target, tiles, board_size=10):
         return ["PASS"]
     return bfs_next_step(pos, target, tiles, board_size)
 
-# --- ECONOMIC & VOLATILITY ENGINE ---
+# --- ECONOMIC, OPPONENT MODELING & VOLATILITY ENGINE ---
 
 def safe_int(x, default=0):
     try:
@@ -147,11 +156,37 @@ def get_market_price(obs, item, base_price=0):
         return safe_int(p, base_price)
     return base_price
 
+def analyze_opponent_state(obs, player):
+    """
+    Feature 9: Opponent State Parsing & Counter-Play Engine
+    Inspects opponent's farm to detect feed demand and crop gluts.
+    """
+    opp_index = 1 - player if isinstance(player, int) and player in (0, 1) else 1
+    farms = obs.get("farms", [])
+    if len(farms) <= opp_index or not isinstance(farms[opp_index], dict):
+        return {"opp_animals": 0, "opp_melons": 0}
+        
+    opp_farm = farms[opp_index]
+    opp_tiles = opp_farm.get("tiles", []) or []
+    
+    opp_animals = 0
+    opp_melons = 0
+    
+    for y in range(len(opp_tiles)):
+        row = opp_tiles[y]
+        if not isinstance(row, list): continue
+        for x in range(len(row)):
+            t = row[x]
+            if isinstance(t, dict):
+                kind = t.get("kind")
+                if kind in ("COOP", "PASTURE") and t.get("animal"):
+                    opp_animals += 1
+                elif kind == "PLANT" and t.get("crop") == "MELON":
+                    opp_melons += 1
+                    
+    return {"opp_animals": opp_animals, "opp_melons": opp_melons}
+
 def update_and_check_volatility(obs, step_num):
-    """
-    Feature 1: Track price history & detect supply gluts (20%+ drop over 2 days / 48 steps).
-    Returns dict of {crop: is_glut_boolean}.
-    """
     gluts = {}
     for crop, spec in CROP_SPECS.items():
         curr_p = get_market_price(obs, crop, spec["base"])
@@ -159,7 +194,6 @@ def update_and_check_volatility(obs, step_num):
             _PRICE_HISTORY[crop] = deque(maxlen=48)
         _PRICE_HISTORY[crop].append((step_num, curr_p))
         
-        # Check price drop over available history
         if len(_PRICE_HISTORY[crop]) >= 12:
             oldest_p = _PRICE_HISTORY[crop][0][1]
             if oldest_p > 0 and (curr_p / oldest_p) <= 0.80:
@@ -171,7 +205,7 @@ def update_and_check_volatility(obs, step_num):
             
     return gluts
 
-def evaluate_crop_roi(crop, obs, day, money, town_demands, gluts):
+def evaluate_crop_roi(crop, obs, day, money, town_demands, gluts, opp_analysis):
     spec = CROP_SPECS[crop]
     days_left = max(0, 30 - day)
     
@@ -182,26 +216,26 @@ def evaluate_crop_roi(crop, obs, day, money, town_demands, gluts):
     mkt_p = get_market_price(obs, crop, base_p)
     actual_p = max(1, mkt_p)
     
-    # Base ROI per tile per day
     net_profit = (actual_p * spec["max_yield"]) - spec["seed"]
     daily_roi = net_profit / spec["first_day"]
     
-    # Feature 1: Price Glut Penalty
     if gluts.get(crop, False):
         daily_roi *= 0.50
         
-    # Town demand multiplier
     if crop in town_demands:
         daily_roi *= 1.35
         
-    # Feature 3: Town Demand Predictive Pre-Planting
-    # Shops unlock every 3 days (Day 3, 6, 9, 12, 15, 18, 21, 24, 27)
+    # Town demand predictive boost (shop unlock every 3 days)
     days_to_next_shop = 3 - (day % 3)
     if days_to_next_shop == 2 and spec["first_day"] == 2:
-        # 2-day crop planted today matures EXACTLY on the upcoming shop unlock!
         daily_roi *= 1.35
         
-    # Strategic crop weighting
+    # Opponent Counter-Play Adjustments
+    if opp_analysis.get("opp_animals", 0) >= 2 and crop == "WHEAT":
+        daily_roi *= 1.25  # Opponent feed demand will boost wheat market price!
+    if opp_analysis.get("opp_melons", 0) >= 4 and crop == "MELON":
+        daily_roi *= 0.50  # Opponent melon glut avoidance!
+        
     if crop == "WHEAT":
         daily_roi *= 1.25
     elif crop == "CARROT":
@@ -213,16 +247,15 @@ def evaluate_crop_roi(crop, obs, day, money, town_demands, gluts):
     elif crop == "TOMATO":
         daily_roi *= 1.05 if days_left >= 10 else 0.2
 
-    # End-game filter (Day 22+)
     if day >= 22 and spec["first_day"] > 2:
         return -100.0
         
     return daily_roi
 
-def select_best_crop(obs, day, money, town_demands, gluts):
+def select_best_crop(obs, day, money, town_demands, gluts, opp_analysis):
     candidates = []
     for crop in CROP_SPECS:
-        roi = evaluate_crop_roi(crop, obs, day, money, town_demands, gluts)
+        roi = evaluate_crop_roi(crop, obs, day, money, town_demands, gluts, opp_analysis)
         if roi > -50:
             candidates.append((roi, crop))
             
@@ -267,12 +300,13 @@ def agent(obs):
     
     town_demands = get_town_demands(obs)
     gluts = update_and_check_volatility(obs, step_num)
+    opp_analysis = analyze_opponent_state(obs, player)
     
     # 1. SCAN BOARD TILES
     empty_tiles = []
     weed_tiles = []
-    plant_tiles = []  # (pos, dict)
-    animal_tiles = [] # (pos, dict)
+    plant_tiles = []
+    animal_tiles = []
     
     for y in range(len(tiles)):
         row = tiles[y]
@@ -303,25 +337,35 @@ def agent(obs):
     market_orders = []
     CASH_RESERVE = 350
     
-    # Strategic Selling with Glut Hold
-    products_to_sell = ["EGG", "MILK", "WOOL", "FERTILIZER"]
+    # FEATURE 1 & 6: TOWN SHOP PREMIUM ARBITRAGE & SELLING
+    # Every 4th hour (townShopSellInterval), town shop demand pays premium 1.5x rates
+    is_town_sell_hour = (hour % 4 == 0)
     
-    for crop in ["MELON", "STRAWBERRY", "TOMATO", "CARROT"]:
-        qty = safe_int(shed.get(crop, 0), 0)
+    # Prioritize items in town demand during sell hour
+    priority_sells = []
+    regular_sells = []
+    
+    for item in ["EGG", "MILK", "WOOL", "FERTILIZER", "MELON", "STRAWBERRY", "TOMATO", "CARROT"]:
+        qty = safe_int(shed.get(item, 0), 0)
         if qty > 0:
-            # If crop is in severe glut and day < 28, hold inventory for price recovery
-            if gluts.get(crop, False) and day < 28:
+            if gluts.get(item, False) and day < 28:
                 continue
-            products_to_sell.append(crop)
-            
-    if day >= 28:
-        products_to_sell.extend(["WHEAT", "MELON", "STRAWBERRY", "TOMATO", "CARROT"])
-        
-    for prod in set(products_to_sell):
-        qty = safe_int(shed.get(prod, 0), 0)
-        if qty > 0 and len(market_orders) < 10:
+            if is_town_sell_hour and item in town_demands:
+                priority_sells.append((item, qty))
+            else:
+                regular_sells.append((item, qty))
+                
+    # Insert priority sells first to maximize premium arbitrage
+    for prod, qty in priority_sells + regular_sells:
+        if len(market_orders) < 10:
             market_orders.append(["SELL", prod, qty])
             
+    if day >= 28:
+        for prod in ["WHEAT", "MELON", "STRAWBERRY", "TOMATO", "CARROT", "EGG", "MILK", "WOOL", "FERTILIZER"]:
+            qty = safe_int(shed.get(prod, 0), 0)
+            if qty > 0 and len(market_orders) < 10:
+                market_orders.append(["SELL", prod, qty])
+                
     # Wheat Selling / Reserve
     if day < 28:
         needed_feed = num_animals * 3
@@ -329,6 +373,18 @@ def agent(obs):
         if sellable_wheat > 0 and len(market_orders) < 10:
             market_orders.append(["SELL", "WHEAT", sellable_wheat])
             
+    # FEATURE 8: BULK SEED STOCKPILING IN EARLY MORNING (HOUR 0-3)
+    # Buy seed batches (3 units) during quiet morning hours to free up 10 market order slots for harvest turns
+    if hour <= 3 and day < 25 and len(market_orders) < 8:
+        target_seed_crop = select_best_crop(obs, day, money, town_demands, gluts, opp_analysis)
+        current_seed_cnt = safe_int(seeds.get(target_seed_crop, 0), 0)
+        scost = CROP_SPECS[target_seed_crop]["seed"]
+        
+        if current_seed_cnt < 3 and money - (scost * 3) - CASH_RESERVE >= 0:
+            market_orders.append(["BUY_SEED", target_seed_crop, 3])
+            money -= scost * 3
+            seeds[target_seed_crop] = seeds.get(target_seed_crop, 0) + 3
+
     # Emergency Wheat Feed Purchase
     if num_animals > 0 and (wheat_in_shed + wheat_seeds) < num_animals and day < 28:
         gap = max(1, num_animals * 2 - (wheat_in_shed + wheat_seeds))
@@ -338,12 +394,11 @@ def agent(obs):
             money -= wp * gap
             wheat_in_shed += gap
 
-    # Diversified Livestock Engine (COW, SHEEP, GOOSE mix)
+    # Diversified Livestock Engine
     if day < 22 and money >= 750 and (wheat_in_shed + wheat_seeds + active_wheat_plants) >= (num_animals + 1) * 3 + 2:
         empty_coops = [p for p, t in animal_tiles if t.get("kind") == "COOP" and t.get("animal") is None]
         empty_pastures = [p for p, t in animal_tiles if t.get("kind") == "PASTURE" and t.get("animal") is None]
         
-        # Priority order for animal mix diversity
         animal_mix_priority = ["COW", "SHEEP", "COW", "GOOSE"]
         for anim in animal_mix_priority:
             spec = ANIMAL_SPECS[anim]
@@ -368,20 +423,19 @@ def agent(obs):
                 market_orders.append(["BUY_LAND"])
                 money -= next_land_cost
 
-    # 3. FEATURE 4: BURST FARM HAND HIRING ENGINE (HOUR 0-2 FIBONACCI OPTIMIZATION)
+    # 3. BURST FARM HAND HIRING ENGINE
     urgent_water = sum(1 for _, t in plant_tiles if not t.get("watered_today", False))
     urgent_harvest = sum(1 for _, t in plant_tiles if safe_int(t.get("yield_units", 0), 0) > 0)
     urgent_feed = sum(1 for _, t in animal_tiles if t.get("animal") and not t.get("fed_today", False))
     
     total_workload = urgent_water + urgent_harvest + (urgent_feed * 2) + len(empty_tiles)
     
-    # Early morning burst hiring: hire up to 4 hands at Hour 0-2 if workload is high
     if hour <= 2 and total_workload >= 5:
         target_hands = min(5, max(2, total_workload // 2))
     elif hour <= 18:
         target_hands = min(4, max(0, total_workload // 3))
     else:
-        target_hands = 0  # No late night hiring
+        target_hands = 0
         
     if day >= 28:
         target_hands = min(3, max(0, urgent_harvest // 2))
@@ -398,7 +452,7 @@ def agent(obs):
         current_hands += 1
         hires_today += 1
 
-    # 4. TASK QUEUE & FEATURE 2: FERTILIZER MAXIMIZATION PIPELINE
+    # 4. TASK QUEUE & FEATURE 10: ONGOING CROP FLOW LOCK PREVENTION
     task_queue = []
     
     # Priority 0: Emergency Animal Feed
@@ -412,8 +466,14 @@ def agent(obs):
             if not t.get("watered_today", False):
                 task_queue.append({"priority": 1, "pos": p, "action": ["WATER"], "type": "WATER"})
 
-    # Priority 2: FEATURE 2 - Target Fertilizer Window Delivery
-    # Melon bonus window: Days 6-8 | Wheat/Carrot: Day 2
+    # Priority 1.5: FEATURE 10 - Ongoing Crop Harvest (Tomato & Strawberry)
+    # Immediate priority harvest to prevent production flow blocking for subsequent ticks
+    for p, t in plant_tiles:
+        crop = t.get("crop")
+        if crop in ("TOMATO", "STRAWBERRY") and safe_int(t.get("yield_units", 0), 0) > 0:
+            task_queue.append({"priority": 1.5, "pos": p, "action": ["HARVEST"], "type": "HARVEST"})
+
+    # Priority 2: Target Fertilizer Window Delivery
     if day < 28:
         for p, t in plant_tiles:
             crop = t.get("crop")
@@ -429,14 +489,15 @@ def agent(obs):
             if in_bonus_window:
                 task_queue.append({"priority": 2, "pos": p, "action": ["FERTILIZE"], "type": "FERTILIZE"})
 
-    # Priority 2: Harvest Ready Crops & Animals
+    # Priority 2: Harvest Ready One-Time Crops & Animals
     for p, t in plant_tiles:
-        if safe_int(t.get("yield_units", 0), 0) > 0:
+        crop = t.get("crop")
+        if crop not in ("TOMATO", "STRAWBERRY") and safe_int(t.get("yield_units", 0), 0) > 0:
             task_queue.append({"priority": 2, "pos": p, "action": ["HARVEST"], "type": "HARVEST"})
-        elif t.get("crop") in CROP_SPECS:
-            spec = CROP_SPECS[t["crop"]]
+        elif crop in CROP_SPECS and CROP_SPECS[crop]["one_time"]:
+            spec = CROP_SPECS[crop]
             planted_d = safe_int(t.get("planted_day", day), day)
-            if spec["one_time"] and (day - planted_d) >= spec["first_day"]:
+            if (day - planted_d) >= spec["first_day"]:
                 task_queue.append({"priority": 2, "pos": p, "action": ["HARVEST"], "type": "HARVEST"})
                 
     for p, t in animal_tiles:
@@ -472,10 +533,20 @@ def agent(obs):
             if shed_adj:
                 task_queue.append({"priority": 2, "pos": shed_adj[0], "action": ["PICKUP", anim, 1], "type": "PICKUP"})
 
-    # Priority 6: Plant High-ROI Crops on Empty Tiles
+    # Priority 6: FEATURE 7 - SPATIAL FARM ZONING PLANTING
+    # Pick empty tiles closer to shed for high-frequency crops (Wheat/Carrot) and structure placements
     if day < 28 and empty_tiles:
-        best_crop = select_best_crop(obs, day, money, town_demands, gluts)
-        for p in empty_tiles:
+        best_crop = select_best_crop(obs, day, money, town_demands, gluts, opp_analysis)
+        
+        # Sort empty tiles: if crop is Wheat/Carrot, pick closest to shed; if Melon, pick outer perimeter
+        if best_crop in ("WHEAT", "CARROT"):
+            sorted_empty = sorted(empty_tiles, key=lambda p: min_dist_to_shed(p))
+        elif best_crop == "MELON":
+            sorted_empty = sorted(empty_tiles, key=lambda p: min_dist_to_shed(p), reverse=True)
+        else:
+            sorted_empty = empty_tiles
+            
+        for p in sorted_empty:
             seed_cnt = safe_int(seeds.get(best_crop, 0), 0)
             if seed_cnt > 0:
                 task_queue.append({"priority": 6, "pos": p, "action": ["PLANT", best_crop], "type": "PLANT"})
@@ -501,7 +572,6 @@ def agent(obs):
         chosen_action = ["PASS"]
         matched_target = None
         
-        # Carrying wheat -> Feed unfed animal
         if carrying_wheat > 0:
             feed_tasks = [t for t in task_queue if t["type"] == "FEED" and tuple(t["pos"]) not in assigned_targets]
             if feed_tasks:
@@ -512,7 +582,6 @@ def agent(obs):
                 else:
                     chosen_action = move_towards(wpos, best_t["pos"], tiles, board_size)
                     
-        # Carrying fertilizer -> Fertilize bonus window crop
         if matched_target is None and carrying_fert > 0:
             fert_tasks = [t for t in task_queue if t["type"] == "FERTILIZE" and tuple(t["pos"]) not in assigned_targets]
             if fert_tasks:
@@ -523,7 +592,6 @@ def agent(obs):
                 else:
                     chosen_action = move_towards(wpos, best_t["pos"], tiles, board_size)
 
-        # Unfed animal, worker has no wheat, shed HAS wheat -> Pickup Wheat
         if matched_target is None and carrying_wheat <= 0 and wheat_in_shed > 0:
             unfed_tasks = [t for t in task_queue if t["type"] == "FEED" and tuple(t["pos"]) not in assigned_targets]
             if unfed_tasks:
@@ -535,7 +603,6 @@ def agent(obs):
                     chosen_action = move_towards(wpos, s_target, tiles, board_size)
                     matched_target = {"pos": s_target}
 
-        # Fertilizer task exists, worker has no fert, shed HAS fert -> Pickup Fertilizer
         if matched_target is None and carrying_fert <= 0 and fertilizer_in_shed > 0:
             fert_tasks = [t for t in task_queue if t["type"] == "FERTILIZE" and tuple(t["pos"]) not in assigned_targets]
             if fert_tasks:
@@ -547,7 +614,6 @@ def agent(obs):
                     chosen_action = move_towards(wpos, s_target, tiles, board_size)
                     matched_target = {"pos": s_target}
 
-        # Match general priority tasks
         if matched_target is None:
             best_t = None
             best_key = None
