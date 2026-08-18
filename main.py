@@ -1,534 +1,323 @@
-# Kaggriculture competitive agent
-# Single-file submission: main.py
+# ============================================================
+# KAGGRICULTURE - GLOBAL PROFIT SCHEDULER
+# ============================================================
 #
 # Strategy:
-#   - Hire cheap farm hands early.
-#   - Keep every worker productive.
-#   - Harvest immediately when profitable.
-#   - Water all crops before they can miss a day.
-#   - Plant continuously.
-#   - Use dynamic market prices.
-#   - Sell shed inventory frequently.
-#   - Avoid expensive land until existing land is saturated.
-#   - Use fertilizer selectively.
+#   1. Evaluate the whole farm every turn.
+#   2. Build a global list of jobs.
+#   3. Score jobs by urgency + economic value + distance.
+#   4. Assign different workers to different jobs.
+#   5. Keep the farm continuously productive.
+#   6. Adapt crop choice to live market prices.
+#   7. Exploit fertilizer on high-value one-time crops.
+#   8. Run animals only when their economics justify them.
+#   9. Hire hands aggressively while cheap.
+#  10. Preserve cash for productive investments.
 #
-# The final function is: agent(obs) -> action
+# Final required function:
+#     agent(obs)
+#
+# Standard library only.
+# ============================================================
 
-CROPS = [
+
+CROPS = (
     "WHEAT",
     "CARROT",
     "TOMATO",
     "STRAWBERRY",
     "MELON",
-]
+)
 
-# Conservative estimated economics.
-# These are used only for choosing priorities. Actual prices
-# always come from the observation.
-CROP_SCORE = {
-    "WHEAT": 1.00,
-    "CARROT": 1.05,
-    "TOMATO": 1.20,
-    "STRAWBERRY": 1.35,
-    "MELON": 1.45,
-}
-
-# Growth estimates used only as a fallback.
-GROWTH = {
-    "WHEAT": 2,
-    "CARROT": 3,
-    "TOMATO": 4,
-    "STRAWBERRY": 5,
-    "MELON": 6,
-}
-
-# Approximate seed costs.
+# Official documented economics.
 SEED_COST = {
     "WHEAT": 10,
-    "CARROT": 15,
-    "TOMATO": 20,
-    "STRAWBERRY": 30,
+    "CARROT": 20,
+    "TOMATO": 50,
+    "STRAWBERRY": 100,
     "MELON": 80,
 }
 
-# Crop preference changes as the season progresses.
-# Fast crops become more attractive near the end.
-def crop_value(crop, price, day):
-    base = CROP_SCORE.get(crop, 1.0)
+BASE_PRICE = {
+    "WHEAT": 25,
+    "CARROT": 35,
+    "TOMATO": 60,
+    "STRAWBERRY": 120,
+    "MELON": 250,
+}
 
-    # Current market price matters more than our static estimate.
-    p = float(price or 1)
+FIRST_YIELD_DAY = {
+    "WHEAT": 2,
+    "CARROT": 2,
+    "TOMATO": 8,
+    "STRAWBERRY": 10,
+    "MELON": 10,
+}
 
-    # Approximate value per seed.
-    cost = SEED_COST.get(crop, 20)
+MAX_YIELD_DAY = {
+    "WHEAT": 4,
+    "CARROT": 3,
+    "MELON": 12,
+}
 
-    # Higher price and lower cost -> better score.
-    value = base * (p / max(cost, 1))
+ANIMALS = {
+    "GOOSE": {
+        "cost": 300,
+        "product": "EGG",
+        "price": 50,
+        "interval": 1,
+        "structure": "COOP",
+    },
+    "COW": {
+        "cost": 400,
+        "product": "MILK",
+        "price": 160,
+        "interval": 2,
+        "structure": "PASTURE",
+    },
+    "SHEEP": {
+        "cost": 500,
+        "product": "WOOL",
+        "price": 200,
+        "interval": 3,
+        "structure": "PASTURE",
+    },
+}
 
-    # End-season adjustment.
-    remaining = max(0, 30 - day)
+ANIMAL_ORDER = ("GOOSE", "COW", "SHEEP")
 
-    growth = GROWTH.get(crop, 4)
 
-    if growth > remaining:
-        value *= 0.08
-    elif growth + 1 > remaining:
-        value *= 0.30
-    elif growth <= 2:
-        value *= 1.15
+# ============================================================
+# SAFE HELPERS
+# ============================================================
 
-    return value
+def number(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def integer(v, default=0):
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def position(unit):
+    try:
+        return int(unit[0]), int(unit[1])
+    except Exception:
+        return 0, 0
+
+
+def distance(a, b):
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def tile_at(farm, p):
+    x, y = p
+    tiles = farm.get("tiles", [])
+
+    if y < 0 or y >= len(tiles):
+        return None
+
+    if x < 0 or x >= len(tiles[y]):
+        return None
+
+    return tiles[y][x]
 
 
 def tile_kind(tile):
-    if tile is None:
-        return None
-    if tile == "LOCKED":
-        return "LOCKED"
     if isinstance(tile, dict):
         return tile.get("kind")
     return None
 
 
 def is_plant(tile):
-    return isinstance(tile, dict) and tile.get("kind") == "PLANT"
+    return tile_kind(tile) == "PLANT"
 
 
-def is_animal(tile):
+def is_weed(tile):
+    return tile_kind(tile) == "WEED"
+
+
+def is_structure(tile):
+    return tile_kind(tile) in ("COOP", "PASTURE")
+
+
+def is_animal_structure(tile):
     return (
-        isinstance(tile, dict)
-        and tile.get("kind") in ("COOP", "PASTURE")
+        is_structure(tile)
         and tile.get("animal") is not None
     )
 
 
-def is_structure(tile):
-    return (
-        isinstance(tile, dict)
-        and tile.get("kind") in ("COOP", "PASTURE")
-    )
+def is_empty(tile):
+    return tile is None
 
 
-def is_weed(tile):
-    return isinstance(tile, dict) and tile.get("kind") == "WEED"
+def direction_to(src, dst):
+    sx, sy = src
+    dx, dy = dst
 
+    if sx == dx and sy == dy:
+        return ["PASS"]
 
-def manhattan(a, b):
-    return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
-
-def nearest_target(pos, targets):
-    if not targets:
-        return None
-
-    best = None
-    best_d = 10**9
-
-    for target in targets:
-        d = manhattan(pos, target)
-        if d < best_d:
-            best_d = d
-            best = target
-
-    return best
-
-
-def direction_toward(pos, target):
-    x, y = pos
-    tx, ty = target
-
-    dx = tx - x
-    dy = ty - y
-
-    # Prefer the larger distance first to reduce zig-zagging.
-    if abs(dx) >= abs(dy):
-        if dx > 0:
+    # Prefer the axis with the larger distance.
+    if abs(dx - sx) >= abs(dy - sy):
+        if dx > sx:
             return ["EAST"]
-        if dx < 0:
-            return ["WEST"]
+        return ["WEST"]
 
-    if dy > 0:
+    if dy > sy:
         return ["SOUTH"]
-    if dy < 0:
-        return ["NORTH"]
 
-    return ["PASS"]
+    return ["NORTH"]
 
 
-def unlocked_empty_tiles(farm):
-    result = []
-
-    tiles = farm.get("tiles", [])
-
-    for y, row in enumerate(tiles):
-        for x, tile in enumerate(row):
-            if tile is None:
-                result.append((x, y))
-
-    return result
-
+# ============================================================
+# FARM SCANNER
+# ============================================================
 
 def scan_farm(farm):
     plants = []
-    watered_needed = []
     harvestable = []
+    needs_water = []
     weeds = []
-    animals = []
     empty = []
+    structures = []
+    animals = []
 
-    tiles = farm.get("tiles", [])
-
-    for y, row in enumerate(tiles):
+    for y, row in enumerate(farm.get("tiles", [])):
         for x, tile in enumerate(row):
+
             p = (x, y)
+
+            if tile == "LOCKED":
+                continue
 
             if tile is None:
                 empty.append(p)
+                continue
 
-            elif is_weed(tile):
+            if is_weed(tile):
                 weeds.append(p)
+                continue
 
-            elif is_plant(tile):
+            if is_plant(tile):
+
                 plants.append(p)
 
                 if not tile.get("watered_today", False):
-                    watered_needed.append(p)
+                    needs_water.append(p)
 
-                crop = tile.get("crop")
-                planted_day = tile.get("planted_day", 0)
-                age = max(0, farm.get("_current_day", 0) - planted_day)
-
-                # The environment exposes yield_units. If positive,
-                # harvesting is usually preferable to waiting.
-                if tile.get("yield_units", 0) > 0:
+                if integer(tile.get("yield_units", 0)) > 0:
                     harvestable.append(p)
 
-                # Fallback for crops whose yield is not yet represented.
-                if crop in GROWTH and age >= GROWTH[crop]:
-                    if p not in harvestable:
-                        harvestable.append(p)
+                continue
 
-            elif is_animal(tile):
-                animals.append(p)
+            if is_structure(tile):
+
+                structures.append(p)
+
+                if tile.get("animal") is not None:
+                    animals.append(p)
 
     return {
         "plants": plants,
-        "water": watered_needed,
-        "harvest": harvestable,
+        "harvestable": harvestable,
+        "water": needs_water,
         "weeds": weeds,
-        "animals": animals,
         "empty": empty,
+        "structures": structures,
+        "animals": animals,
     }
 
 
-def shed_total(shed):
-    total = 0
-    for v in shed.values():
-        try:
-            total += int(v)
-        except Exception:
-            pass
-    return total
+# ============================================================
+# MARKET ECONOMICS
+# ============================================================
 
-
-def market_sell_orders(obs):
-    """
-    Sell harvested resources sitting in the shed.
-
-    We don't blindly sell fertilizer or seeds.
-    Fertilizer is a strategic input.
-    """
-    private = obs.get("private", {})
-    shed = private.get("shed", {})
-    market = obs.get("market", {})
-    prices = market.get("prices", {})
-
-    orders = []
-
-    # Products that can safely be liquidated.
-    products = [
-        "WHEAT",
-        "CARROT",
-        "TOMATO",
-        "STRAWBERRY",
-        "MELON",
-        "EGG",
-        "MILK",
-        "WOOL",
-    ]
-
-    # During the final days, liquidate aggressively.
-    day = obs.get("day", 0)
-    final_phase = day >= 27
-
-    for item in products:
-        amount = int(shed.get(item, 0) or 0)
-
-        if amount <= 0:
-            continue
-
-        price = int(prices.get(item, 1) or 1)
-
-        # Don't hoard harvested produce.
-        # End game values banked money, not inventory.
-        if final_phase:
-            sell_n = amount
-        else:
-            sell_n = amount
-
-        if sell_n > 0:
-            orders.append(["SELL", item, sell_n])
-
-    return orders
-
-
-def choose_seed_orders(obs):
-    """
-    Buy seeds dynamically.
-
-    We maintain a small rolling buffer instead of buying
-    huge quantities. This prevents cash from becoming trapped
-    in seeds and allows adaptation to market conditions.
-    """
-    private = obs.get("private", {})
-    seeds = private.get("seeds", {})
-
-    farm = obs["farms"][obs["player"]]
-    money = float(farm.get("money", 0))
-
-    day = int(obs.get("day", 0))
-
+def live_price(obs, item):
     prices = obs.get("market", {}).get("prices", {})
-
-    remaining = max(0, 30 - day)
-
-    # End game: don't buy seeds that cannot reasonably pay back.
-    if remaining <= 2:
-        return []
-
-    candidates = []
-
-    for crop in CROPS:
-        seed_count = int(seeds.get(crop, 0) or 0)
-
-        # Keep a rolling buffer.
-        target = 2
-
-        if crop == "WHEAT":
-            target = 4
-
-        # Near endgame use smaller inventory.
-        if remaining <= 5:
-            target = 1
-
-        if seed_count >= target:
-            continue
-
-        cost = SEED_COST.get(crop, 20)
-
-        if money < cost:
-            continue
-
-        score = crop_value(
-            crop,
-            prices.get(crop, 1),
-            day,
-        )
-
-        candidates.append((score, crop, target - seed_count))
-
-    candidates.sort(reverse=True)
-
-    orders = []
-
-    # Buy only the best few crops.
-    for _, crop, amount in candidates[:2]:
-        if amount > 0:
-            orders.append(["BUY_SEED", crop, amount])
-
-    return orders
+    return number(
+        prices.get(
+            item,
+            BASE_PRICE.get(item, 1),
+        ),
+        1,
+    )
 
 
-def hire_orders(obs):
+def price_ratio(obs, crop):
+    price = live_price(obs, crop)
+    cost = SEED_COST.get(crop, 1)
+
+    return price / max(cost, 1)
+
+
+def crop_profit_score(obs, crop):
     """
-    Farm hands are extremely valuable because they create
-    parallel actions every turn.
-
-    The hire cost is Fibonacci-like and resets each day.
-    We therefore hire aggressively while the farm has
-    enough cash, but avoid draining the bank.
+    Estimate profit density rather than simply choosing
+    the highest sale price.
     """
-    farm = obs["farms"][obs["player"]]
-    money = float(farm.get("money", 0))
 
-    hires_today = int(farm.get("hires_today", 0) or 0)
+    day = integer(obs.get("day", 0))
+    remaining = 30 - day
 
-    # Fibonacci-like cost sequence:
-    # 1, 1, 2, 3, 5, 8, ...
-    fib = [1, 1]
+    price = live_price(obs, crop)
+    cost = SEED_COST.get(crop, 1)
+    first = FIRST_YIELD_DAY.get(crop, 10)
 
-    while len(fib) <= hires_today + 2:
-        fib.append(fib[-1] + fib[-2])
+    roi = price / max(cost, 1)
 
-    next_cost = fib[min(hires_today, len(fib) - 1)]
+    # Long crops become dangerous late in the season.
+    if first > remaining:
+        return -1000000.0
 
-    hands = len(farm.get("hands", []))
+    # Production efficiency.
+    roi *= 1.0 / max(first, 1) * 10.0
 
-    # Don't explode hiring after the farm is already sufficiently parallel.
-    #
-    # Early game:
-    #   1-3 hands
-    #
-    # Mid game:
-    #   3-5 hands
-    #
-    # Late game:
-    #   use cheap hands when possible, but don't burn capital.
-    if obs.get("day", 0) < 8:
-        desired = 4
-    elif obs.get("day", 0) < 18:
-        desired = 5
-    else:
-        desired = 3
+    # Premium crops are attractive only while their price
+    # has not collapsed.
+    if crop in ("STRAWBERRY", "MELON"):
+        if price <= BASE_PRICE[crop] * 0.45:
+            roi *= 0.25
 
-    if hands >= desired:
-        return []
+    # Fast crops become increasingly attractive near the end.
+    if remaining <= 6:
+        if first <= 2:
+            roi *= 4.0
+        else:
+            roi *= 0.10
 
-    # Preserve a cash reserve.
-    if money < next_cost + 150:
-        return []
+    elif remaining <= 10:
+        if first <= 3:
+            roi *= 2.0
+        elif first >= 8:
+            roi *= 0.35
 
-    return [["HIRE"]]
+    # Ongoing crops become more attractive when enough season remains.
+    if crop == "TOMATO" and remaining >= 14:
+        roi *= 1.35
 
+    if crop == "STRAWBERRY" and remaining >= 16:
+        roi *= 1.20
 
-def land_orders(obs):
-    """
-    Land expansion is useful only after the currently unlocked
-    area is being exploited.
-
-    Buy one new quadrant when:
-      - cash is healthy
-      - unlocked area is substantially occupied
-      - enough season remains
-    """
-    farm = obs["farms"][obs["player"]]
-    money = float(farm.get("money", 0))
-    day = int(obs.get("day", 0))
-
-    unlocked = set(farm.get("unlocked_quadrants", []))
-
-    if day < 5:
-        return []
-
-    # Only expand if we have enough cash left to operate.
-    if money < 2200:
-        return []
-
-    if len(unlocked) >= 4:
-        return []
-
-    info = scan_farm(farm)
-
-    empty = len(info["empty"])
-    plants = len(info["plants"])
-
-    # Current 5x5 area is still spacious.
-    if empty > 10 and plants < 12:
-        return []
-
-    # Expansion costs 1000, 2000, 4000.
-    # Only buy first/second expansion with a healthy reserve.
-    if len(unlocked) == 1 and money >= 2500:
-        return [["BUY_LAND"]]
-
-    if len(unlocked) == 2 and money >= 4000:
-        return [["BUY_LAND"]]
-
-    return []
-
-
-def animal_market_orders(obs):
-    """
-    Animal strategy is deliberately conservative.
-
-    Animals can generate recurring production and fertilizer,
-    but they require daily feeding/care and structures.
-    We avoid buying them before the crop operation is stable.
-    """
-    day = int(obs.get("day", 0))
-    if day < 7 or day > 25:
-        return []
-
-    farm = obs["farms"][obs["player"]]
-    money = float(farm.get("money", 0))
-
-    if money < 700:
-        return []
-
-    # Count current animals.
-    animal_count = 0
-    structures = 0
-
-    for row in farm.get("tiles", []):
-        for tile in row:
-            if is_structure(tile):
-                structures += 1
-                if tile.get("animal") is not None:
-                    animal_count += 1
-
-    # Start with a single animal.
-    if animal_count >= 2:
-        return []
-
-    # Buy one goose as the cheapest/safer animal choice.
-    if structures >= 1:
-        return [["BUY_ANIMAL", "GOOSE", 1]]
-
-    return []
-
-
-def market_actions(obs):
-    """
-    Market is free from movement, so use it every turn.
-
-    Maximum is 10 orders per turn.
-    """
-    orders = []
-
-    # Sell first. Banked cash is what ultimately matters.
-    orders.extend(market_sell_orders(obs))
-
-    # Buy seeds.
-    orders.extend(choose_seed_orders(obs))
-
-    # Hire.
-    orders.extend(hire_orders(obs))
-
-    # Occasional animal investment.
-    orders.extend(animal_market_orders(obs))
-
-    # Land expansion should be rare and late in the order list.
-    orders.extend(land_orders(obs))
-
-    # Never exceed the environment's market order cap.
-    return orders[:10]
+    return roi
 
 
 def best_crop(obs):
-    """
-    Choose the crop with the best current price/economics.
-    """
-    prices = obs.get("market", {}).get("prices", {})
-    day = int(obs.get("day", 0))
-
     best = "WHEAT"
-    best_score = -1
+    best_score = -10**30
 
     for crop in CROPS:
-        score = crop_value(
+
+        score = crop_profit_score(
+            obs,
             crop,
-            prices.get(crop, 1),
-            day,
         )
 
         if score > best_score:
@@ -538,285 +327,1330 @@ def best_crop(obs):
     return best
 
 
-def nearest_action(pos, farm, obs, occupied_targets=None):
-    """
-    Decide what a worker should do.
-
-    Priority:
-      1. harvest
-      2. water
-      3. animal maintenance
-      4. weed clearing
-      5. plant
-      6. fertilizer
-      7. return to useful region
-    """
-    if occupied_targets is None:
-        occupied_targets = set()
-
-    info = scan_farm(farm)
-
-    # Remove targets already assigned to another worker.
-    def free_targets(items):
-        return [
-            p for p in items
-            if p not in occupied_targets
-        ]
-
-    # 1. Harvest.
-    targets = free_targets(info["harvest"])
-
-    target = nearest_target(pos, targets)
-
-    if target is not None:
-        if tuple(pos) == tuple(target):
-            return ["HARVEST"], target
-
-        return direction_toward(pos, target), target
-
-    # 2. Water.
-    targets = free_targets(info["water"])
-
-    target = nearest_target(pos, targets)
-
-    if target is not None:
-        if tuple(pos) == tuple(target):
-            return ["WATER"], target
-
-        return direction_toward(pos, target), target
-
-    # 3. Animals.
-    animal_targets = []
-
-    for y, row in enumerate(farm.get("tiles", [])):
-        for x, tile in enumerate(row):
-            if is_animal(tile):
-                animal_targets.append((x, y))
-
-    target = nearest_target(pos, free_targets(animal_targets))
-
-    if target is not None:
-        tile = farm["tiles"][target[1]][target[0]]
-
-        if tuple(pos) == tuple(target):
-
-            # Feed first.
-            if not tile.get("fed_today", False):
-                return ["FEED"], target
-
-            # Care after feeding.
-            if not tile.get("cared_today", False):
-                return ["CARE"], target
-
-            # Collect fertilizer if available.
-            if tile.get("fertilizer_available", False):
-                return ["COLLECT_FERTILIZER"], target
-
-            # Harvest animal output.
-            if tile.get("yield_units", 0) > 0:
-                return ["HARVEST"], target
-
-            return ["PASS"], target
-
-        return direction_toward(pos, target), target
-
-    # 4. Clear weeds.
-    targets = free_targets(info["weeds"])
-
-    target = nearest_target(pos, targets)
-
-    if target is not None:
-        if tuple(pos) == tuple(target):
-            return ["DIG"], target
-
-        return direction_toward(pos, target), target
-
-    # 5. Plant.
-    empty = free_targets(info["empty"])
-
-    target = nearest_target(pos, empty)
-
-    if target is not None:
-        if tuple(pos) == tuple(target):
-            crop = best_crop(obs)
-
-            seeds = obs.get("private", {}).get("seeds", {})
-
-            if seeds.get(crop, 0) > 0:
-                return ["PLANT", crop], target
-
-            # Find any available seed.
-            for c in sorted(
-                CROPS,
-                key=lambda c: crop_value(
-                    c,
-                    obs.get("market", {}).get("prices", {}).get(c, 1),
-                    obs.get("day", 0),
-                ),
-                reverse=True,
-            ):
-                if seeds.get(c, 0) > 0:
-                    return ["PLANT", c], target
-
-            return ["PASS"], target
-
-        return direction_toward(pos, target), target
-
-    return ["PASS"], None
-
-
-def fallback_action(pos, farm):
-    """
-    If there is nothing urgent, stay near the central farm area.
-
-    This prevents workers from wandering aimlessly across
-    locked quadrants.
-    """
-    center = (4, 4)
-
-    if tuple(pos) == center:
-        return ["PASS"]
-
-    return direction_toward(pos, center)
-
-
-def worker_action(index, obs, farm, occupied):
-    """
-    Compute one action for farmer or farm hand.
-    """
-    positions = [farm.get("farmer", [0, 0])]
-    positions.extend(farm.get("hands", []))
-
-    if index >= len(positions):
-        return ["PASS"]
-
-    pos = positions[index]
-
-    action, target = nearest_action(
-        pos,
-        farm,
-        obs,
-        occupied,
+def ranked_crops(obs):
+    return sorted(
+        CROPS,
+        key=lambda c: crop_profit_score(obs, c),
+        reverse=True,
     )
 
-    if target is not None:
-        occupied.add(tuple(target))
 
-    return action
+# ============================================================
+# WORKER JOB MODEL
+# ============================================================
+
+def add_job(jobs, job_type, target, score, crop=None):
+    jobs.append({
+        "type": job_type,
+        "target": target,
+        "score": float(score),
+        "crop": crop,
+    })
 
 
-def shed_management(obs):
-    """
-    If a worker is standing beside the shed and carrying inventory,
-    DROP it.
+def plant_jobs(obs, farm, info, jobs):
+    seeds = obs.get("private", {}).get("seeds", {})
 
-    We only use this as a secondary action when there is no urgent
-    field work for that worker.
-    """
-    private = obs.get("private", {})
-    inventories = private.get("inventories", [])
+    ranked = ranked_crops(obs)
 
-    farm = obs["farms"][obs["player"]]
+    best = ranked[0]
 
-    shed_positions = {
-        (4, 4),
-        (5, 4),
-        (4, 5),
-        (5, 5),
-    }
+    if integer(seeds.get(best, 0)) <= 0:
 
-    actions = []
+        best = None
 
-    positions = [farm.get("farmer", [])]
-    positions.extend(farm.get("hands", []))
+        for crop in ranked:
+            if integer(seeds.get(crop, 0)) > 0:
+                best = crop
+                break
 
-    for i, pos in enumerate(positions):
-        if i >= len(inventories):
+    if best is None:
+        return
+
+    crop_score = crop_profit_score(
+        obs,
+        best,
+    )
+
+    day = integer(obs.get("day", 0))
+
+    for p in info["empty"]:
+
+        # Avoid planting enormous fields late in the season.
+        if day >= 28:
+            break
+
+        score = (
+            35.0
+            + crop_score * 10.0
+        )
+
+        add_job(
+            jobs,
+            "PLANT",
+            p,
+            score,
+            best,
+        )
+
+
+def harvest_jobs(obs, farm, info, jobs):
+
+    day = integer(obs.get("day", 0))
+
+    for p in info["harvestable"]:
+
+        tile = tile_at(farm, p)
+
+        if not is_plant(tile):
             continue
 
-        if tuple(pos) not in shed_positions:
+        crop = tile.get("crop", "WHEAT")
+
+        units = integer(
+            tile.get("yield_units", 1)
+        )
+
+        price = live_price(
+            obs,
+            crop,
+        )
+
+        # Harvest value.
+        value = units * price
+
+        # Very high priority because harvest unlocks the tile.
+        score = (
+            1000.0
+            + value * 5.0
+        )
+
+        # Endgame liquidation.
+        if day >= 27:
+            score += 1000.0
+
+        add_job(
+            jobs,
+            "HARVEST",
+            p,
+            score,
+            crop,
+        )
+
+
+def water_jobs(obs, farm, info, jobs):
+
+    day = integer(obs.get("day", 0))
+
+    for p in info["water"]:
+
+        tile = tile_at(farm, p)
+
+        if not is_plant(tile):
             continue
 
-        inv = inventories[i] or {}
+        crop = tile.get("crop", "WHEAT")
 
-        carrying = False
+        consecutive = integer(
+            tile.get(
+                "consecutive_unwatered",
+                0,
+            )
+        )
 
-        for v in inv.values():
-            try:
-                if int(v) > 0:
-                    carrying = True
-                    break
-            except Exception:
-                pass
+        # Watering is mandatory, but watering during the
+        # bonus window has additional economic value.
+        score = 700.0
 
-        if carrying:
-            actions.append((i, ["DROP"]))
+        if consecutive >= 1:
+            score += 700.0
 
-    return actions
+        if crop in MAX_YIELD_DAY:
+
+            planted = integer(
+                tile.get("planted_day", day)
+            )
+
+            age = max(
+                0,
+                day - planted,
+            )
+
+            bonus_start = (
+                MAX_YIELD_DAY[crop] + 1
+            ) // 2
+
+            if age >= bonus_start:
+                score += 600.0
+
+        # Fertilized plants are particularly valuable to water.
+        fertilized_until = integer(
+            tile.get(
+                "fertilized_until_day",
+                -1,
+            ),
+            -1,
+        )
+
+        if fertilized_until >= day:
+            score += 500.0
+
+        add_job(
+            jobs,
+            "WATER",
+            p,
+            score,
+            crop,
+        )
 
 
-def build_structure_action(obs, farm):
-    """
-    Build one animal structure if we have enough money and
-    an empty tile. This is intentionally slow and conservative.
-    """
-    day = int(obs.get("day", 0))
+def fertilizer_jobs(obs, farm, info, jobs):
 
-    if day < 8 or day > 24:
+    shed = obs.get(
+        "private",
+        {},
+    ).get(
+        "shed",
+        {},
+    )
+
+    fertilizer = integer(
+        shed.get("FERTILIZER", 0)
+    )
+
+    if fertilizer <= 0:
+        return
+
+    day = integer(
+        obs.get("day", 0)
+    )
+
+    for p in info["plants"]:
+
+        tile = tile_at(
+            farm,
+            p,
+        )
+
+        if not is_plant(tile):
+            continue
+
+        crop = tile.get(
+            "crop",
+            "WHEAT",
+        )
+
+        # Fertilizer is most valuable on one-time crops
+        # while they are inside the yield-building window.
+        if crop not in MAX_YIELD_DAY:
+            continue
+
+        planted = integer(
+            tile.get(
+                "planted_day",
+                day,
+            )
+        )
+
+        age = max(
+            0,
+            day - planted,
+        )
+
+        bonus_start = (
+            MAX_YIELD_DAY[crop] + 1
+        ) // 2
+
+        if age > MAX_YIELD_DAY[crop]:
+            continue
+
+        if age < bonus_start:
+            continue
+
+        current_until = integer(
+            tile.get(
+                "fertilized_until_day",
+                -1,
+            ),
+            -1,
+        )
+
+        if current_until >= day:
+            continue
+
+        value = (
+            crop_profit_score(
+                obs,
+                crop,
+            )
+            * 100
+        )
+
+        add_job(
+            jobs,
+            "FERTILIZE",
+            p,
+            500.0 + value,
+            crop,
+        )
+
+
+def weed_jobs(obs, farm, info, jobs):
+
+    for p in info["weeds"]:
+
+        add_job(
+            jobs,
+            "DIG",
+            p,
+            250.0,
+        )
+
+
+# ============================================================
+# ANIMAL JOBS
+# ============================================================
+
+def animal_jobs(obs, farm, info, jobs):
+
+    for p in info["animals"]:
+
+        tile = tile_at(
+            farm,
+            p,
+        )
+
+        if not is_animal_structure(tile):
+            continue
+
+        # Survival first.
+        if not tile.get(
+            "fed_today",
+            False,
+        ):
+            add_job(
+                jobs,
+                "FEED",
+                p,
+                1500.0,
+            )
+            continue
+
+        # Care creates a future production bonus.
+        if not tile.get(
+            "cared_today",
+            False,
+        ):
+            add_job(
+                jobs,
+                "CARE",
+                p,
+                900.0,
+            )
+
+        # Fertilizer is free recurring income.
+        if tile.get(
+            "fertilizer_available",
+            False,
+        ):
+            add_job(
+                jobs,
+                "COLLECT_FERTILIZER",
+                p,
+                850.0,
+            )
+
+        # Harvest accumulated animal output.
+        if integer(
+            tile.get(
+                "yield_units",
+                0,
+            )
+        ) > 0:
+            animal = tile.get(
+                "animal"
+            )
+
+            data = ANIMALS.get(
+                animal,
+                {},
+            )
+
+            product = data.get(
+                "product"
+            )
+
+            price = live_price(
+                obs,
+                product,
+            )
+
+            units = integer(
+                tile.get(
+                    "yield_units",
+                    1,
+                )
+            )
+
+            add_job(
+                jobs,
+                "HARVEST_ANIMAL",
+                p,
+                850.0 + units * price * 4,
+            )
+
+
+# ============================================================
+# GLOBAL JOB BUILDER
+# ============================================================
+
+def build_jobs(obs, farm):
+
+    info = scan_farm(
+        farm
+    )
+
+    jobs = []
+
+    harvest_jobs(
+        obs,
+        farm,
+        info,
+        jobs,
+    )
+
+    animal_jobs(
+        obs,
+        farm,
+        info,
+        jobs,
+    )
+
+    water_jobs(
+        obs,
+        farm,
+        info,
+        jobs,
+    )
+
+    fertilizer_jobs(
+        obs,
+        farm,
+        info,
+        jobs,
+    )
+
+    weed_jobs(
+        obs,
+        farm,
+        info,
+        jobs,
+    )
+
+    plant_jobs(
+        obs,
+        farm,
+        info,
+        jobs,
+    )
+
+    # Highest-value jobs first.
+    jobs.sort(
+        key=lambda j: j["score"],
+        reverse=True,
+    )
+
+    return jobs
+
+
+# ============================================================
+# GLOBAL WORKER ASSIGNMENT
+# ============================================================
+
+def assign_jobs(obs, farm, jobs):
+
+    workers = [
+        farm.get(
+            "farmer",
+            [0, 0],
+        )
+    ]
+
+    workers.extend(
+        farm.get(
+            "hands",
+            [],
+        )
+    )
+
+    assignments = [
+        None
+        for _ in workers
+    ]
+
+    used_targets = set()
+
+    # Assign the most valuable job to the worker
+    # for whom it has the best utility.
+    for worker_index, worker_pos in enumerate(workers):
+
+        best_job = None
+        best_utility = -10**30
+
+        for job in jobs:
+
+            target = job["target"]
+
+            if target in used_targets:
+                continue
+
+            d = distance(
+                position(worker_pos),
+                target,
+            )
+
+            # Movement is expensive because every movement
+            # consumes a whole turn.
+            utility = (
+                job["score"]
+                - d * 45.0
+            )
+
+            # Small role preference.
+            if worker_index == 0:
+                # Farmer is best used for urgent jobs.
+                if job["type"] in (
+                    "HARVEST",
+                    "FEED",
+                    "HARVEST_ANIMAL",
+                ):
+                    utility += 120.0
+
+            if utility > best_utility:
+
+                best_utility = utility
+                best_job = job
+
+        if best_job is not None:
+
+            assignments[
+                worker_index
+            ] = best_job
+
+            used_targets.add(
+                best_job["target"]
+            )
+
+    return assignments
+
+
+# ============================================================
+# JOB EXECUTION
+# ============================================================
+
+def execute_job(
+    worker_pos,
+    job,
+    farm,
+    obs,
+):
+
+    if job is None:
+        return ["PASS"]
+
+    target = job["target"]
+
+    current = position(
+        worker_pos
+    )
+
+    if current != target:
+        return direction_to(
+            current,
+            target,
+        )
+
+    job_type = job["type"]
+
+    if job_type == "HARVEST":
+        return ["HARVEST"]
+
+    if job_type == "WATER":
+        return ["WATER"]
+
+    if job_type == "FERTILIZE":
+        return ["FERTILIZE"]
+
+    if job_type == "DIG":
+        return ["DIG"]
+
+    if job_type == "PLANT":
+
+        crop = job.get(
+            "crop"
+        )
+
+        seeds = obs.get(
+            "private",
+            {},
+        ).get(
+            "seeds",
+            {},
+        )
+
+        if (
+            crop
+            and integer(
+                seeds.get(
+                    crop,
+                    0,
+                )
+            ) > 0
+        ):
+            return [
+                "PLANT",
+                crop,
+            ]
+
+        return ["PASS"]
+
+    if job_type == "FEED":
+        return ["FEED"]
+
+    if job_type == "CARE":
+        return ["CARE"]
+
+    if job_type == "COLLECT_FERTILIZER":
+        return [
+            "COLLECT_FERTILIZER"
+        ]
+
+    if job_type == "HARVEST_ANIMAL":
+        return ["HARVEST"]
+
+    return ["PASS"]
+
+
+# ============================================================
+# ANIMAL PURCHASE / PLACEMENT
+# ============================================================
+
+def animal_strategy(obs, farm, info):
+
+    day = integer(
+        obs.get("day", 0)
+    )
+
+    money = number(
+        farm.get(
+            "money",
+            0,
+        )
+    )
+
+    # Animals need enough season remaining to amortize setup.
+    if day < 4 or day > 22:
+        return []
+
+    structures = info["structures"]
+    animals = info["animals"]
+
+    orders = []
+
+    # One goose is the safest first animal.
+    # Cheap setup and daily production.
+    if len(animals) == 0:
+
+        if money >= 900:
+
+            # Only buy if there is a structure already
+            # or we can build one.
+            if len(structures) > 0:
+
+                orders.append(
+                    [
+                        "BUY_ANIMAL",
+                        "GOOSE",
+                        1,
+                    ]
+                )
+
+    # Don't flood the farm with animals.
+    if len(animals) >= 2:
+        return orders
+
+    return orders
+
+
+# ============================================================
+# MARKET MANAGER
+# ============================================================
+
+def market_actions(obs, farm, info):
+
+    private = obs.get(
+        "private",
+        {},
+    )
+
+    shed = private.get(
+        "shed",
+        {},
+    )
+
+    seeds = private.get(
+        "seeds",
+        {},
+    )
+
+    money = number(
+        farm.get(
+            "money",
+            0,
+        )
+    )
+
+    day = integer(
+        obs.get(
+            "day",
+            0,
+        )
+    )
+
+    orders = []
+
+    # --------------------------------------------------------
+    # SELL HARVESTED GOODS
+    # --------------------------------------------------------
+
+    sellable = (
+        "WHEAT",
+        "CARROT",
+        "TOMATO",
+        "STRAWBERRY",
+        "MELON",
+        "EGG",
+        "MILK",
+        "WOOL",
+    )
+
+    for item in sellable:
+
+        amount = integer(
+            shed.get(
+                item,
+                0,
+            )
+        )
+
+        if amount <= 0:
+            continue
+
+        price = live_price(
+            obs,
+            item,
+        )
+
+        # Premium goods are sold only when they are not being
+        # destroyed by a market glut.
+        if item in (
+            "STRAWBERRY",
+            "MELON",
+            "MILK",
+            "WOOL",
+        ):
+            base = BASE_PRICE.get(
+                item,
+                price,
+            )
+
+            if price < base * 0.35 and day < 27:
+                # Keep a small reserve, but don't hoard forever.
+                sell_amount = max(
+                    0,
+                    amount - 2,
+                )
+            else:
+                sell_amount = amount
+
+        else:
+            sell_amount = amount
+
+        if sell_amount > 0:
+            orders.append(
+                [
+                    "SELL",
+                    item,
+                    sell_amount,
+                ]
+            )
+
+    # --------------------------------------------------------
+    # SEED PURCHASE
+    # --------------------------------------------------------
+
+    ranked = ranked_crops(
+        obs
+    )
+
+    # Keep multiple seeds rather than betting the whole farm
+    # on one market quote.
+    for crop in ranked[:2]:
+
+        have = integer(
+            seeds.get(
+                crop,
+                0,
+            )
+        )
+
+        target = 5
+
+        if day >= 24:
+            target = 2
+
+        needed = max(
+            0,
+            target - have,
+        )
+
+        if needed <= 0:
+            continue
+
+        cost = SEED_COST.get(
+            crop,
+            20,
+        )
+
+        # Keep enough cash for operations.
+        reserve = (
+            1000
+            if day < 15
+            else 500
+        )
+
+        affordable = int(
+            max(
+                0,
+                money - reserve,
+            )
+            // cost
+        )
+
+        buy = min(
+            needed,
+            affordable,
+        )
+
+        if buy > 0:
+
+            orders.append(
+                [
+                    "BUY_SEED",
+                    crop,
+                    buy,
+                ]
+            )
+
+    # --------------------------------------------------------
+    # WHEAT BUFFER
+    # --------------------------------------------------------
+
+    wheat = integer(
+        seeds.get(
+            "WHEAT",
+            0,
+        )
+    )
+
+    # Animals consume wheat.
+    animal_count = len(
+        info["animals"]
+    )
+
+    desired_wheat = (
+        5
+        + animal_count * 2
+    )
+
+    if wheat < desired_wheat:
+
+        amount = desired_wheat - wheat
+
+        affordable = int(
+            max(
+                0,
+                money - 300,
+            )
+            // SEED_COST["WHEAT"]
+        )
+
+        amount = min(
+            amount,
+            affordable,
+        )
+
+        if amount > 0:
+
+            orders.append(
+                [
+                    "BUY_SEED",
+                    "WHEAT",
+                    amount,
+                ]
+            )
+
+    # --------------------------------------------------------
+    # FERTILIZER PURCHASE
+    # --------------------------------------------------------
+
+    fertilizer = integer(
+        shed.get(
+            "FERTILIZER",
+            0,
+        )
+    )
+
+    high_value_plants = 0
+
+    for p in info["plants"]:
+
+        tile = tile_at(
+            farm,
+            p,
+        )
+
+        if not is_plant(tile):
+            continue
+
+        crop = tile.get(
+            "crop",
+        )
+
+        if crop in (
+            "TOMATO",
+            "STRAWBERRY",
+            "MELON",
+        ):
+            high_value_plants += 1
+
+    # Buy a small fertilizer buffer when useful.
+    if (
+        high_value_plants >= 2
+        and fertilizer < 2
+        and money >= 1000
+    ):
+
+        orders.append(
+            [
+                "BUY_PRODUCT",
+                "FERTILIZER",
+                1,
+            ]
+        )
+
+    # --------------------------------------------------------
+    # HIRE HANDS
+    # --------------------------------------------------------
+
+    hands = farm.get(
+        "hands",
+        [],
+    )
+
+    hires_today = integer(
+        farm.get(
+            "hires_today",
+            0,
+        )
+    )
+
+    fib = [1, 1]
+
+    while len(fib) <= hires_today:
+        fib.append(
+            fib[-1]
+            + fib[-2]
+        )
+
+    hire_cost = fib[
+        min(
+            hires_today,
+            len(fib) - 1,
+        )
+    ]
+
+    # Early/mid game: maximize action count.
+    desired_hands = 6
+
+    if day >= 24:
+        desired_hands = 4
+
+    if len(hands) < desired_hands:
+
+        if money >= hire_cost + 500:
+
+            orders.append(
+                ["HIRE"]
+            )
+
+    # --------------------------------------------------------
+    # LAND
+    # --------------------------------------------------------
+
+    quadrants = farm.get(
+        "unlocked_quadrants",
+        [],
+    )
+
+    occupied = (
+        len(info["plants"])
+        + len(info["structures"])
+    )
+
+    empty = len(
+        info["empty"]
+    )
+
+    # Land is only useful when the current area is genuinely busy.
+    if (
+        day >= 7
+        and day <= 22
+        and len(quadrants) < 4
+        and money >= 2500
+        and occupied >= 18
+        and empty <= 7
+    ):
+
+        orders.append(
+            ["BUY_LAND"]
+        )
+
+    # --------------------------------------------------------
+    # ANIMALS
+    # --------------------------------------------------------
+
+    orders.extend(
+        animal_strategy(
+            obs,
+            farm,
+            info,
+        )
+    )
+
+    return orders[:10]
+
+
+# ============================================================
+# BUILD ANIMAL STRUCTURE
+# ============================================================
+
+def structure_action(
+    obs,
+    farm,
+    info,
+):
+
+    day = integer(
+        obs.get(
+            "day",
+            0,
+        )
+    )
+
+    if day < 3 or day > 22:
         return None
 
-    money = float(farm.get("money", 0))
+    # Build a coop if we have none.
+    coop_exists = False
+    pasture_exists = False
 
-    if money < 500:
-        return None
+    for p in info["structures"]:
 
-    # Only build if we don't already have structures.
-    structures = 0
+        tile = tile_at(
+            farm,
+            p,
+        )
 
-    for row in farm.get("tiles", []):
-        for tile in row:
-            if is_structure(tile):
-                structures += 1
+        if not isinstance(
+            tile,
+            dict,
+        ):
+            continue
 
-    if structures >= 1:
-        return None
+        if tile.get(
+            "kind"
+        ) == "COOP":
+            coop_exists = True
 
-    empty = unlocked_empty_tiles(farm)
+        if tile.get(
+            "kind"
+        ) == "PASTURE":
+            pasture_exists = True
+
+    empty = info["empty"]
 
     if not empty:
         return None
 
-    # Build near center to reduce future movement.
-    center = (4, 4)
-    target = nearest_target(center, empty)
+    farmer = position(
+        farm.get(
+            "farmer",
+            [0, 0],
+        )
+    )
 
-    if target is None:
+    target = min(
+        empty,
+        key=lambda p: distance(
+            farmer,
+            p,
+        )
+    )
+
+    if target != farmer:
+        return direction_to(
+            farmer,
+            target,
+        )
+
+    if not coop_exists:
+        return [
+            "BUILD_COOP"
+        ]
+
+    # Pasture is only needed for future cows/sheep.
+    if (
+        day <= 15
+        and not pasture_exists
+        and len(info["animals"]) >= 1
+    ):
+        return [
+            "BUILD_PASTURE"
+        ]
+
+    return None
+
+
+# ============================================================
+# ANIMAL PLACEMENT
+# ============================================================
+
+def placement_action(
+    obs,
+    farm,
+    worker_index,
+    worker_pos,
+):
+
+    shed = obs.get(
+        "private",
+        {},
+    ).get(
+        "shed",
+        {},
+    )
+
+    current = position(
+        worker_pos,
+    )
+
+    tile = tile_at(
+        farm,
+        current,
+    )
+
+    # Only place an animal when standing on its matching structure.
+    if not is_structure(tile):
         return None
 
-    pos = tuple(farm.get("farmer", [0, 0]))
+    structure = tile.get(
+        "kind"
+    )
 
-    if pos == target:
-        return ["BUILD_COOP"]
+    if tile.get(
+        "animal"
+    ) is not None:
+        return None
 
-    return direction_toward(pos, target)
+    desired = None
 
+    if structure == "COOP":
+        desired = "GOOSE"
+
+    elif structure == "PASTURE":
+
+        if integer(
+            shed.get(
+                "SHEEP",
+                0,
+            )
+        ) > 0:
+            desired = "SHEEP"
+
+        elif integer(
+            shed.get(
+                "COW",
+                0,
+            )
+        ) > 0:
+            desired = "COW"
+
+    if desired is None:
+        return None
+
+    if integer(
+        shed.get(
+            desired,
+            0,
+        )
+    ) <= 0:
+        return None
+
+    return [
+        "PLACE",
+        desired,
+        1,
+    ]
+
+
+# ============================================================
+# SHED MANAGEMENT
+# ============================================================
+
+def inventory_total(inv):
+    total = 0
+
+    if not isinstance(
+        inv,
+        dict,
+    ):
+        return 0
+
+    for value in inv.values():
+        total += integer(
+            value,
+            0,
+        )
+
+    return total
+
+
+def shed_management(
+    obs,
+    farm,
+    actions,
+):
+
+    private = obs.get(
+        "private",
+        {},
+    )
+
+    inventories = private.get(
+        "inventories",
+        [],
+    )
+
+    if not inventories:
+        return actions
+
+    positions = [
+        farm.get(
+            "farmer",
+            [0, 0],
+        )
+    ]
+
+    positions.extend(
+        farm.get(
+            "hands",
+            [],
+        )
+    )
+
+    # Starting shed is around the central area of the
+    # initially unlocked quadrant. Use several adjacent cells.
+    shed_points = (
+        (2, 2),
+        (1, 2),
+        (2, 1),
+        (3, 2),
+        (2, 3),
+    )
+
+    for i, inv in enumerate(
+        inventories
+    ):
+
+        if i >= len(
+            positions
+        ):
+            break
+
+        if i >= len(
+            actions
+        ):
+            break
+
+        if inventory_total(
+            inv
+        ) <= 0:
+            continue
+
+        if actions[i][0] != "PASS":
+            continue
+
+        pos = position(
+            positions[i]
+        )
+
+        near = min(
+            shed_points,
+            key=lambda p: distance(
+                pos,
+                p,
+            )
+        )
+
+        if distance(
+            pos,
+            near,
+        ) <= 1:
+
+            actions[i] = [
+                "DROP"
+            ]
+
+    return actions
+
+
+# ============================================================
+# MAIN AGENT
+# ============================================================
 
 def agent(obs):
-    """
-    Main Kaggriculture agent.
 
-    Must return:
-        {
-            "farmer": [...],
-            "hands": [[...], ...],
-            "market": [[...], ...]
-        }
-    """
     try:
-        player = int(obs.get("player", 0))
 
-        farms = obs.get("farms", [])
-        if not farms or player >= len(farms):
+        player = integer(
+            obs.get(
+                "player",
+                0,
+            )
+        )
+
+        farms = obs.get(
+            "farms",
+            [],
+        )
+
+        if (
+            not farms
+            or player < 0
+            or player >= len(farms)
+        ):
+
             return {
                 "farmer": ["PASS"],
                 "hands": [],
@@ -825,79 +1659,184 @@ def agent(obs):
 
         farm = farms[player]
 
-        # Keep current day available to scan_farm.
-        # We do not mutate the real observation in a meaningful way,
-        # only attach a harmless local field to this dictionary.
-        farm["_current_day"] = int(obs.get("day", 0))
+        info = scan_farm(
+            farm
+        )
 
-        # Market work is independent of movement.
-        market = market_actions(obs)
+        # ----------------------------------------------------
+        # MARKET
+        # ----------------------------------------------------
 
-        # Determine number of workers.
-        hands_positions = farm.get("hands", [])
-        worker_count = 1 + len(hands_positions)
+        market = market_actions(
+            obs,
+            farm,
+            info,
+        )
+
+        # ----------------------------------------------------
+        # GLOBAL JOB SCHEDULER
+        # ----------------------------------------------------
+
+        jobs = build_jobs(
+            obs,
+            farm,
+        )
+
+        assignments = assign_jobs(
+            obs,
+            farm,
+            jobs,
+        )
+
+        # ----------------------------------------------------
+        # WORKER ACTIONS
+        # ----------------------------------------------------
+
+        workers = [
+            farm.get(
+                "farmer",
+                [0, 0],
+            )
+        ]
+
+        workers.extend(
+            farm.get(
+                "hands",
+                [],
+            )
+        )
 
         actions = []
 
-        occupied = set()
+        for i, worker in enumerate(
+            workers
+        ):
 
-        for i in range(worker_count):
-            action = worker_action(
-                i,
+            # Animal placement can override an idle worker.
+            placement = placement_action(
                 obs,
                 farm,
-                occupied,
+                i,
+                worker,
             )
 
-            actions.append(action)
+            if placement is not None:
+                actions.append(
+                    placement
+                )
+                continue
+
+            job = (
+                assignments[i]
+                if i < len(assignments)
+                else None
+            )
+
+            action = execute_job(
+                worker,
+                job,
+                farm,
+                obs,
+            )
+
+            actions.append(
+                action
+            )
+
+        # ----------------------------------------------------
+        # STRUCTURE BUILDING
+        # ----------------------------------------------------
+
+        if actions:
+
+            if actions[0][0] == "PASS":
+
+                build = structure_action(
+                    obs,
+                    farm,
+                    info,
+                )
+
+                if build is not None:
+                    actions[0] = build
+
+        # ----------------------------------------------------
+        # INVENTORY DROP
+        # ----------------------------------------------------
+
+        actions = shed_management(
+            obs,
+            farm,
+            actions,
+        )
+
+        # ----------------------------------------------------
+        # SAFE OUTPUT
+        # ----------------------------------------------------
 
         farmer_action = actions[0]
-        hand_actions = actions[1:]
 
-        # Shed drops are only used if the worker isn't currently
-        # doing something more important.
-        drops = shed_management(obs)
+        hands_actions = []
 
-        for index, drop_action in drops:
-            if index < len(actions):
-                # Drop only when worker has no urgent action.
-                if actions[index][0] == "PASS":
-                    actions[index] = drop_action
+        for action in actions[1:]:
 
-        # Structure construction is lower priority than crop work.
-        # Only invoke if farmer would otherwise be idle.
-        if farmer_action[0] == "PASS":
-            structure_action = build_structure_action(
-                obs,
-                farm,
-            )
+            if (
+                isinstance(
+                    action,
+                    list,
+                )
+                and action
+            ):
+                hands_actions.append(
+                    action
+                )
+            else:
+                hands_actions.append(
+                    ["PASS"]
+                )
 
-            if structure_action is not None:
-                farmer_action = structure_action
+        if not isinstance(
+            farmer_action,
+            list,
+        ):
+            farmer_action = [
+                "PASS"
+            ]
 
         return {
             "farmer": farmer_action,
-            "hands": hand_actions,
+            "hands": hands_actions,
             "market": market[:10],
         }
 
     except Exception:
-        # Never crash the Kaggle environment.
-        # A PASS is vastly better than a traceback.
-        hands = []
 
+        # The competition should never receive a traceback.
+        # Return valid no-op actions instead.
         try:
-            hands = [
-                ["PASS"]
-                for _ in obs.get("farms", [])[obs.get("player", 0)].get(
-                    "hands", []
+            farm = obs.get(
+                "farms",
+                [],
+            )[obs.get(
+                "player",
+                0,
+            )]
+
+            n = len(
+                farm.get(
+                    "hands",
+                    [],
                 )
-            ]
+            )
+
         except Exception:
-            hands = []
+            n = 0
 
         return {
             "farmer": ["PASS"],
-            "hands": hands,
+            "hands": [
+                ["PASS"]
+                for _ in range(n)
+            ],
             "market": [],
         }
